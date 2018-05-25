@@ -2,14 +2,17 @@
 The disparate session (Session) is for making requests to multiple locations.
 '''
 
+from abc import ABCMeta, abstractmethod
 from copy import copy
 from functools import partialmethod
 from urllib.parse import urlparse, urlunparse
 
+from h11 import RemoteProtocolError
+
 from multio import asynclib
 
 from .cookie_utils import CookieTracker
-from .errors import RequestTimeout
+from .errors import RequestTimeout, BadHttpResponse
 from .req_structs import SocketQ
 from .request_object import Request
 from .utils import get_netloc_port
@@ -17,7 +20,7 @@ from .utils import get_netloc_port
 __all__ = ['Session']
 
 
-class BaseSession:
+class BaseSession(metaclass=ABCMeta):
     '''
     The base class for asks' sessions.
     Contains methods for creating sockets, figuring out which type of
@@ -40,7 +43,13 @@ class BaseSession:
         self.source_address = None
         self._cookie_tracker_obj = None
 
-        self.sema = NotImplementedError
+    @property
+    @abstractmethod
+    def sema(self):
+        """
+        A semaphore-like context manager.
+        """
+        ...
 
     async def _open_connection_http(self, location):
         '''
@@ -90,7 +99,7 @@ class BaseSession:
             return await self._open_connection_https(
                 (netloc, int(port))), port
 
-    async def request(self, method, url=None, *, path='', **kwargs):
+    async def request(self, method, url=None, *, path='', retries=1, **kwargs):
         '''
         This is the template for all of the `http method` methods for
         the Session.
@@ -134,15 +143,17 @@ class BaseSession:
         really calling a partial method that has the 'method' argument
         pre-completed.
         '''
-        async with self.sema:
-            timeout = kwargs.pop('timeout', None)
+        async with self._sema:
+            timeout = kwargs.get('timeout', None)
             req_headers = kwargs.pop('headers', None)
 
             if url is None:
                 url = self._make_url() + path
 
-            sock = await self._grab_connection(url)
+            retry = False
+
             try:
+                sock = await self._grab_connection(url)
                 port = sock.port
 
                 if self.headers is not None:
@@ -169,15 +180,32 @@ class BaseSession:
                 if sock is not None:
                     try:
                         if r.headers['connection'].lower() == 'close':
+                            await sock.close()
                             sock._active = False
                     except KeyError:
                         pass
-
-            finally:
-                # Unless sock was set to None (streaming mode), put it back
-                # no matter the kind of error that happened.
-                if sock:
                     await self._replace_connection(sock)
+
+            except RemoteProtocolError as e:
+                await sock.close()
+                sock._active = False
+                await self._replace_connection(sock)
+                raise BadHttpResponse('Invalid HTTP response from server.') from e
+
+            except ConnectionError as e:
+                if retries > 0:
+                    retry = True
+                    retries -= 1
+                else:
+                    raise e
+
+        if retry:
+            return (await self.request(method,
+                                       url,
+                                       path=path,
+                                       retries=retries,
+                                       headers=headers,
+                                       **kwargs))
 
         return r
 
@@ -199,14 +227,26 @@ class BaseSession:
             raise RequestTimeout from e
         return sock, r
 
+    @abstractmethod
     def _make_url(self):
-        raise NotImplementedError
+        """
+        A method who's result is concated with a uri path.
+        """
+        ...
 
+    @abstractmethod
     async def _grab_connection(self, url):
-        raise NotImplementedError
+        """
+        A method that will return a socket-like object.
+        """
+        ...
 
+    @abstractmethod
     async def _replace_connection(self, sock):
-        raise NotImplementedError
+        """
+        A method that will accept a socket-like object.
+        """
+        ...
 
 
 class Session(BaseSession):
@@ -247,7 +287,11 @@ class Session(BaseSession):
         self._conn_pool = SocketQ()
         self._checked_out_sockets = SocketQ()
 
-        self.sema = asynclib.Semaphore(connections)
+        self._sema = asynclib.Semaphore(connections)
+
+    @property
+    def sema(self):
+        return self._sema
 
     def _checkout_connection(self, host_loc):
         try:
@@ -303,3 +347,9 @@ class Session(BaseSession):
         Puts together the hostloc and current endpoint for use in request uri.
         '''
         return (self.base_location or '') + (self.endpoint or '')
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self._conn_pool.free_pool()

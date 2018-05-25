@@ -7,8 +7,6 @@ python:
   - "3.6"
   - "nightly"
 
-cache: pip
-
 install:
    - ./setup.py develop
    - pip3 install pytest-httpbin
@@ -18,7 +16,10 @@ install:
    - pip3 install multio
 
 script:
-  - pytest --verbose --tb=native
+  - pytest tests/test_curio.py --verbose --tb=native
+  - pytest tests/test_trio.py --verbose --tb=native
+  - pytest tests/test_request_object.py --verbose --tb=native
+  - pytest tests/test_response_objects.py --verbose --tb=native
   # - pylint asks tests
   # temp disable until bugfix for
   # AttributeError: 'FunctionDef' object has no attribute 'ancestors'
@@ -35,3 +36,8 @@ notifications:
     on_failure: always
     template:
       - "%{repository}#%{build_number} (%{branch} - %{commit} : %{author}): %{message} %{build_url}"
+
+matrix:
+  fast_finish: true
+  allow_failures:
+    - python: "nightly"
